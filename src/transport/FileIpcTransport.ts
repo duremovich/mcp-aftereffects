@@ -41,6 +41,10 @@ import {
   sweepDeadInstanceDirs,
 } from "./instances.js";
 import { type LaunchPlan, buildLaunchPlan } from "./launcher.js";
+import { type AeProcessLister, listAeProcesses } from "./processes.js";
+
+/** A preflight that found a pushable AE is trusted this long before asking Windows again. */
+const PUSH_PREFLIGHT_CACHE_MS = 15_000;
 
 /**
  * The slice of ChildProcess the transport uses. Injectable (see
@@ -81,6 +85,13 @@ export interface FileIpcTransportOptions {
   spawn?: SpawnFn;
   /** Modal-dialog scan; defaults to scanAeDialogs (Windows and macOS). Injectable for tests. */
   scanDialogs?: () => Promise<AeDialog[]>;
+  /**
+   * Lists running AfterFX.exe processes before a push, so the transport can
+   * refuse instead of letting `-r` boot a throwaway instance. Defaults to the
+   * Windows process query when `spawn` is not injected; otherwise (tests) the
+   * preflight is skipped unless this is given. Return null for "unknown".
+   */
+  listAeProcesses?: AeProcessLister | null;
 }
 
 interface SpawnState {
@@ -158,11 +169,19 @@ export class FileIpcTransport implements AeTransport {
   private readonly instanceOption: string | null | undefined;
   private readonly spawnFn: SpawnFn;
   private readonly scanDialogs: () => Promise<AeDialog[]>;
+  private readonly listProcesses: AeProcessLister | null;
+  private pushPreflightOkAt = 0;
 
   constructor(options: FileIpcTransportOptions = {}) {
     this.instanceOption = options.instance;
     this.spawnFn = options.spawn ?? ((command, args, opts) => nodeSpawn(command, args, opts));
     this.scanDialogs = options.scanDialogs ?? (() => scanAeDialogs());
+    this.listProcesses =
+      options.listAeProcesses !== undefined
+        ? options.listAeProcesses
+        : options.spawn
+          ? null
+          : listAeProcesses;
     try {
       // 0o700: write access to the mailbox is code execution inside AE (see
       // RUNTIME_DIR_MODE). recursive:true applies the mode to what it creates;
@@ -381,12 +400,19 @@ export class FileIpcTransport implements AeTransport {
     // signature of an After Effects stuck behind a dialog — and every `-r`
     // launched at it would only stack a "Cannot run a script while a modal
     // dialog is waiting for response" alert on top. Look before launching.
-    if ((await listInstances()).some((i) => !i.alive)) {
+    const known = await listInstances();
+    if (known.some((i) => !i.alive)) {
       const dialogs = await this.scanDialogs();
       if (dialogs.length > 0) {
         return dialogFailure(dialogs, "nothing was sent to After Effects", started);
       }
     }
+
+    // 0b. Is there an After Effects that can receive `-r` at all? If not,
+    // launching would boot a throwaway instance (the phantom case below) —
+    // refuse without launching anything.
+    const preflight = await this.pushPreflight(known, started);
+    if (preflight !== null) return preflight;
 
     const id = request.id;
     const requestPath = requestPathFor(id);
@@ -591,6 +617,53 @@ export class FileIpcTransport implements AeTransport {
       state.error = err instanceof Error ? err : new Error(String(err));
     }
     return launch;
+  }
+
+  /**
+   * Refuse a push that could only boot a new After Effects: none running, or
+   * every running one started with `-m`. Returns null to proceed. Unknown
+   * process state (non-Windows, query failed) proceeds as upstream does.
+   */
+  private async pushPreflight(
+    known: Awaited<ReturnType<typeof listInstances>>,
+    started: number,
+  ): Promise<EvalResult | null> {
+    if (this.listProcesses === null) return null;
+    if (Date.now() - this.pushPreflightOkAt < PUSH_PREFLIGHT_CACHE_MS) return null;
+    const procs = await this.listProcesses();
+    if (procs === null) return null;
+    if (procs.some((p) => !p.multiInstance)) {
+      this.pushPreflightOkAt = Date.now();
+      return null;
+    }
+    const stale = known.filter((i) => !i.alive);
+    if (procs.length === 0) {
+      return failure(
+        "NO_INSTANCE",
+        "After Effects is not running, so there is nothing to send the script to. Nothing was launched.",
+        {
+          durationMs: Date.now() - started,
+          hint:
+            "Start After Effects (without -m) and open the project, then retry. To have the server start one, " +
+            "use ae_do instance.start.",
+        },
+      );
+    }
+    return failure(
+      "NO_INSTANCE",
+      `every running After Effects (pid ${procs.map((p) => p.pid).join(", ")}) was started with -m, which never ` +
+        "receives `-r` scripts" +
+        (stale.length > 0
+          ? `, and its resident agent (${stale.map((i) => i.id).join(", ")}) has stopped answering`
+          : ", and no resident agent is registered") +
+        ". Nothing was launched.",
+      {
+        durationMs: Date.now() - started,
+        hint:
+          "Restart After Effects WITHOUT -m (run AfterFX.exe directly — the Start Menu shortcut adds -m). " +
+          "A stalled agent usually means AE's 'modal dialog' state got stuck; scripts cannot run until AE restarts.",
+      },
+    );
   }
 
   /**
