@@ -261,10 +261,14 @@ describe("undo group flag", () => {
     process.env.AE_MCP_EXE = INERT_EXE;
   });
 
+  // No process query (listAeProcesses: null): asking Windows which After
+  // Effects run takes most of a second, longer than these 600 ms calls, and
+  // made them flaky — the request could time out before it was written.
+
   it("travels to the dispatcher as an explicit field", async () => {
     // undo/redo must reach AE with no group open (see tests/undo-group.test.ts).
     // The flag is only worth anything if it survives serialization.
-    const transport = new FileIpcTransport({ instance: null });
+    const transport = new FileIpcTransport({ instance: null, listAeProcesses: null });
     const call = transport.execute({
       code: "return 1;",
       label: "offline_undo_off",
@@ -280,7 +284,7 @@ describe("undo group flag", () => {
   it("is sent as true when the caller says nothing", async () => {
     // Explicit rather than omitted: "group this" must not ride on a key that
     // survives the trip.
-    const transport = new FileIpcTransport({ instance: null });
+    const transport = new FileIpcTransport({ instance: null, listAeProcesses: null });
     const call = transport.execute({
       code: "return 1;",
       label: "offline_undo_default",

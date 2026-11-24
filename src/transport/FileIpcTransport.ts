@@ -47,8 +47,8 @@ import { type LaunchPlan, buildLaunchPlan } from "./launcher.js";
 import {
   type AeProcess,
   type AeProcessLister,
+  cachedAeProcesses,
   cachedProcessLister,
-  listAeProcesses,
 } from "./processes.js";
 
 /** A preflight that found a pushable AE is trusted this long before asking Windows again. */
@@ -220,20 +220,15 @@ export class FileIpcTransport implements AeTransport {
     this.instanceOption = options.instance;
     this.spawnFn = options.spawn ?? ((command, args, opts) => nodeSpawn(command, args, opts));
     this.scanDialogs = options.scanDialogs ?? (() => scanAeDialogs());
-    this.listProcesses =
-      options.listAeProcesses !== undefined
+    // One cached query serves the push preflight and the instance states
+    // alike: a push otherwise asked Windows twice (most of a second each).
+    const injected =
+      options.listAeProcesses === undefined || options.listAeProcesses === null
         ? options.listAeProcesses
-        : options.spawn
-          ? null
-          : listAeProcesses;
-    this.instanceProcesses =
-      options.listAeProcesses !== undefined
-        ? options.listAeProcesses === null
-          ? null
-          : cachedProcessLister(options.listAeProcesses)
-        : options.spawn
-          ? null
-          : undefined;
+        : cachedProcessLister(options.listAeProcesses);
+    this.listProcesses =
+      injected !== undefined ? injected : options.spawn ? null : cachedAeProcesses;
+    this.instanceProcesses = injected !== undefined ? injected : options.spawn ? null : undefined;
     try {
       // 0o700: write access to the mailbox is code execution inside AE (see
       // RUNTIME_DIR_MODE). recursive:true applies the mode to what it creates;
