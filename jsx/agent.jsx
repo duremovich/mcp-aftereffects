@@ -25,6 +25,15 @@
 // flagged `busy` around a request so a stale timestamp during a long call
 // (ticks do not fire while a script runs) is not mistaken for a dead instance.
 //
+// Re-arming. The repeating scheduled task has been seen to stop firing for
+// good while After Effects stayed alive and responsive (AE 27.0: 6,453 ticks,
+// no error, then nothing). `$.global.AE_MCP_AGENT.rearm()` cancels the old
+// task and schedules a new one; the server pushes a call to it (through
+// `-r`, which still works when the task does not) when an instance has been
+// stalled for a while. A second evaluation of this file does NOT replace a
+// running agent (see agentMain), so a rebuilt agent takes over only at the
+// next After Effects launch.
+//
 // SECURITY: same trust boundary as the shared mailbox — whoever can write
 // into <runtime>/instances/<id>/ executes code inside this AE. The directory
 // sits under the per-user temp dir like the rest of the runtime. Two things
@@ -48,7 +57,7 @@
 #include "serve.jsx"
 
 (function agentEntry() {
-    var AGENT_VERSION = 1;
+    var AGENT_VERSION = 2;
     var TICK_MS = 250;
     var HEARTBEAT_MS = 1000;
 
@@ -164,6 +173,8 @@
             busySince: null,
             dir: null,
             taskId: null,
+            rearms: 0,
+            lastRearmAt: null,
             lastHeartbeatAt: 0,
             lastError: null
         };
@@ -201,6 +212,7 @@
                 served: state.served,
                 busy: state.busy,
                 busySince: state.busySince,
+                rearms: state.rearms,
                 lastError: state.lastError,
                 ts: now
             };
@@ -241,21 +253,49 @@
             }
         }
 
+        function schedule() {
+            state.taskId = app.scheduleTask("$.global.AE_MCP_AGENT.tick()", TICK_MS, true);
+            return state.taskId;
+        }
+
+        function cancel() {
+            try {
+                if (state.taskId !== null) app.cancelTask(state.taskId);
+            } catch (eCancel) { /* ignore */ }
+            state.taskId = null;
+        }
+
         $.global.AE_MCP_AGENT = {
             state: state,
+            version: AGENT_VERSION,
             tick: tick,
             /** Stop polling (mainly for tests and manual recovery). */
-            stop: function () {
-                try {
-                    if (state.taskId !== null) app.cancelTask(state.taskId);
-                } catch (eCancel) { /* ignore */ }
-                state.taskId = null;
+            stop: cancel,
+            /**
+             * Replace the scheduled task: cancel the old id, schedule a new
+             * repeating one. Does not tick here — it may be called from a
+             * script the dispatcher is serving, and the server waits for the
+             * NEW task's heartbeat as proof that it fires.
+             */
+            rearm: function () {
+                var previous = state.taskId;
+                cancel();
+                state.rearms++;
+                state.lastRearmAt = new Date().getTime();
+                schedule();
+                return {
+                    agentVersion: AGENT_VERSION,
+                    previousTaskId: previous,
+                    taskId: state.taskId,
+                    ticks: state.ticks,
+                    rearms: state.rearms
+                };
             }
         };
         // Run once now so the instance is registered before the first
         // scheduled tick, then keep going for the life of the process.
         tick();
-        state.taskId = app.scheduleTask("$.global.AE_MCP_AGENT.tick()", TICK_MS, true);
+        schedule();
     }
 
     // --- Top-level guard ---------------------------------------------------

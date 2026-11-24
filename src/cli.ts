@@ -111,7 +111,7 @@ export async function runCli(
       }
 
       case "instances": {
-        const instances = await listInstances();
+        const instances = await listInstances(undefined, undefined, { matchAll: true });
         out(`mailbox: ${RUNTIME_DIR}`);
         if (instances.length === 0) {
           out(
@@ -119,7 +119,7 @@ export async function runCli(
           );
           return 0;
         }
-        for (const i of instances) out(`${i.alive ? "live " : "stale"}  ${describeInstance(i)}`);
+        for (const i of instances) out(`${i.state.padEnd(7)}  ${describeInstance(i)}`);
         return 0;
       }
 

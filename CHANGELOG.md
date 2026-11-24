@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Instance liveness comes from the After Effects process, not the heartbeat alone** (Windows). Each agent heartbeat is matched to the running `AfterFX.exe` whose start time is the latest one at or before the agent's `startedAt` (5 s slack, each process used once), and instances now have four states: `live` (fresh heartbeat), `busy` (serving a request, process running), `stalled` (process running, agent not ticking) and `dead` (process gone). Before, an AE force-killed mid-request left a `busy` heartbeat that counted as live for 15 minutes, so every unnamed call failed with "2 After Effects instances are live"; an AE busy rendering for more than 5 s was called stale; and a dead instance was only recognised by its silence. Dead instances are never addressed or counted. Busy and stalled ones stay addressable: requests queue in their mailbox. The process query is cached for 2 s and only runs when some heartbeat is stale and not already proven dead. Without process information (macOS, or the query failed) the old heartbeat rules apply.
+- **A stalled agent is re-armed.** Seen on AE 27.0: the agent's repeating scheduled task stopped firing for good while After Effects stayed responsive. When a call targets an instance that has been stalled for 20 s, shows no dialog, and whose process is the one `-r` reaches (not `-m`, the only such AfterFX.exe), the server pushes a script that calls the new `$.global.AE_MCP_AGENT.rearm()` (agent v2; older agents get the same done by hand) and waits for a fresh heartbeat. The outcome is logged to stderr and returned in the call's `logs`.
+- **Nothing is pushed into an After Effects that shows a modal dialog.** A `-r` launch at an AE behind an in-app warning added a second modal ("Cannot run a script while a modal dialog is waiting for response"). The push path now looks for dialogs before every launch, a stalled instance with a dialog fails with `DIALOG_OPEN` before anything is sent, and the re-arm never pushes into one.
+- **`instance.stop`** works on busy and stalled instances, waits until the matched process has actually exited rather than until the heartbeat goes quiet (a dialog does that too), reports a process that keeps running (with the dialogs it shows), and removes the instance directory only once the process is gone. `instance.list` reports each instance's `state`, `detail` and `pid`, lists `addressable` and `dead` ids, and sweeps dead directories older than an hour; a stalled instance's directory is never swept.
+
 ## [0.3.2] - 2026-10-16
 
 ### Security

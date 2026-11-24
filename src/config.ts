@@ -318,7 +318,7 @@ export function instanceDirFor(id: string): string {
   return path.join(INSTANCES_DIR, id);
 }
 
-/** The agent refreshes heartbeat.json every second; past this it is presumed gone. */
+/** An instance with no heartbeat for this long is busy, stalled or dead, decided by its process (see transport/instances.ts). */
 export const HEARTBEAT_STALE_MS = 5_000;
 
 /**
@@ -328,7 +328,7 @@ export const HEARTBEAT_STALE_MS = 5_000;
  */
 export const HEARTBEAT_BUSY_STALE_MS = 15 * 60_000;
 
-/** An instance directory whose heartbeat is this old is swept at startup. */
+/** A dead instance whose heartbeat is this old has its directory swept (startup, instance.list). Stalled ones never are. */
 export const INSTANCE_DIR_SWEEP_MS = STALE_RUNTIME_FILE_MS;
 
 /** How often a pull call re-checks that its instance is alive while the request waits. */

@@ -35,16 +35,56 @@ import {
   type InstanceInfo,
   type TargetResolution,
   describeInstance,
+  findInstance,
+  getInstanceProcessSource,
   listInstances,
   readInstance,
   resolveTarget,
+  stateDetail,
   sweepDeadInstanceDirs,
 } from "./instances.js";
 import { type LaunchPlan, buildLaunchPlan } from "./launcher.js";
-import { type AeProcessLister, listAeProcesses } from "./processes.js";
+import {
+  type AeProcess,
+  type AeProcessLister,
+  cachedProcessLister,
+  listAeProcesses,
+} from "./processes.js";
 
 /** A preflight that found a pushable AE is trusted this long before asking Windows again. */
 const PUSH_PREFLIGHT_CACHE_MS = 15_000;
+
+/** A stalled (not busy) instance silent this long gets its agent's scheduled task re-armed. */
+export const REARM_STALLED_MS = 20_000;
+
+/** At most one re-arm attempt per instance in this window. */
+const REARM_RETRY_MS = 60_000;
+
+/** How long the re-arm push may take, and how long to wait for the new task's first heartbeat. */
+const REARM_PUSH_TIMEOUT_MS = 15_000;
+const REARM_HEARTBEAT_WAIT_MS = 3_000;
+
+/** While a request waits on a stalled instance, look for a dialog this often. */
+const STALLED_DIALOG_SCAN_MS = 5_000;
+
+/**
+ * Pushed through `-r` into a stalled instance: replace the agent's scheduled
+ * task. Agents from before rearm() (v1) get the same done by hand — their
+ * state object carries the task id. Never ticks itself: the server waits for
+ * the new task's own heartbeat.
+ */
+export const REARM_JSX = `
+    var _a = $.global.AE_MCP_AGENT;
+    if (!_a) return { agent: false };
+    if (typeof _a.rearm === "function") return { agent: true, via: "rearm", detail: _a.rearm() };
+    var _prev = null;
+    try {
+        _prev = _a.state.taskId;
+        if (_prev !== null) app.cancelTask(_prev);
+    } catch (eCancel) { /* ignore */ }
+    _a.state.taskId = app.scheduleTask("$.global.AE_MCP_AGENT.tick()", 250, true);
+    return { agent: true, via: "legacy", detail: { previousTaskId: _prev, taskId: _a.state.taskId, ticks: _a.state.ticks } };
+`;
 
 /**
  * The slice of ChildProcess the transport uses. Injectable (see
@@ -170,7 +210,11 @@ export class FileIpcTransport implements AeTransport {
   private readonly spawnFn: SpawnFn;
   private readonly scanDialogs: () => Promise<AeDialog[]>;
   private readonly listProcesses: AeProcessLister | null;
+  /** Cached lister for instance states; undefined = the module default (getInstanceProcessSource). */
+  private readonly instanceProcesses: AeProcessLister | null | undefined;
   private pushPreflightOkAt = 0;
+  /** Instance id → when its last re-arm was attempted. */
+  private readonly rearmAttempts = new Map<string, number>();
 
   constructor(options: FileIpcTransportOptions = {}) {
     this.instanceOption = options.instance;
@@ -182,6 +226,14 @@ export class FileIpcTransport implements AeTransport {
         : options.spawn
           ? null
           : listAeProcesses;
+    this.instanceProcesses =
+      options.listAeProcesses !== undefined
+        ? options.listAeProcesses === null
+          ? null
+          : cachedProcessLister(options.listAeProcesses)
+        : options.spawn
+          ? null
+          : undefined;
     try {
       // 0o700: write access to the mailbox is code execution inside AE (see
       // RUNTIME_DIR_MODE). recursive:true applies the mode to what it creates;
@@ -219,6 +271,13 @@ export class FileIpcTransport implements AeTransport {
     void this.sweepStaleFiles();
   }
 
+  /** The process lister instance states are decided with (null: heartbeat rules only). */
+  private processSource(): AeProcessLister | null {
+    return this.instanceProcesses === undefined
+      ? getInstanceProcessSource()
+      : this.instanceProcesses;
+  }
+
   /** Where the next call would go. For ae_context and the startup banner; never throws. */
   async describeTarget(instance?: string): Promise<TargetResolution> {
     return this.resolveTarget(instance);
@@ -230,12 +289,13 @@ export class FileIpcTransport implements AeTransport {
    * call names an instance explicitly.
    */
   private async resolveTarget(explicit?: string): Promise<TargetResolution> {
+    const options = { processes: this.processSource() };
     const named = explicit?.trim();
-    if (named) return resolveTarget(named);
+    if (named) return resolveTarget(named, undefined, undefined, options);
     if (this.instanceOption === null) return { mode: "push" };
     const target =
       this.instanceOption === undefined ? instanceTargetFromEnv() : this.instanceOption;
-    return resolveTarget(target);
+    return resolveTarget(target, undefined, undefined, options);
   }
 
   async execute(req: EvalRequest): Promise<EvalResult> {
@@ -310,8 +370,30 @@ export class FileIpcTransport implements AeTransport {
     timeoutMs: number,
   ): Promise<EvalResult> {
     const dir = instance.dir;
+    const instancesDir = path.dirname(dir);
     const requestPath = path.join(dir, `${REQUEST_PREFIX}${request.id}.json`);
     const responsePath = path.join(dir, `${RESPONSE_PREFIX}${request.id}.json`);
+    // Server-side notes (a re-arm, say), handed back in the result's logs.
+    const notes: string[] = [];
+
+    // A stalled instance: its After Effects runs, its agent does not tick. A
+    // modal dialog is the usual reason — then say so and send nothing (the
+    // request would run whenever someone closed it). Otherwise the request
+    // queues; if the agent has been quiet long enough, re-arm it first.
+    let lastDialogScanAt = 0;
+    if (instance.state === "stalled") {
+      lastDialogScanAt = Date.now();
+      const dialogs = await this.dialogsFor(instance);
+      if (dialogs.length > 0) {
+        return dialogFailure(
+          dialogs,
+          `After Effects instance '${instance.id}' is ${stateDetail(instance)}; nothing was sent`,
+          started,
+        );
+      }
+      await this.maybeRearm(instance, notes);
+    }
+
     await fs.mkdir(dir, { recursive: true });
     await this.writeRequest(dir, requestPath, request);
 
@@ -322,11 +404,13 @@ export class FileIpcTransport implements AeTransport {
     const deadline = started + timeoutMs;
     let requestConsumed = false;
     let lastLivenessAt = started;
+    let current: InstanceInfo = instance;
     while (Date.now() < deadline) {
       const parsed = await this.tryReadResponse(responsePath);
       if (parsed) {
         await this.safeUnlink(responsePath);
-        return this.toEvalResult(parsed, Date.now() - started);
+        const result = this.toEvalResult(parsed, Date.now() - started);
+        return notes.length > 0 ? { ...result, logs: [...notes, ...result.logs] } : result;
       }
       const now = Date.now();
       if (!requestConsumed && now - lastLivenessAt >= LIVENESS_CHECK_MS) {
@@ -334,11 +418,14 @@ export class FileIpcTransport implements AeTransport {
         if (!(await this.fileExists(requestPath))) {
           requestConsumed = true;
         } else {
-          // Still waiting to be picked up: is anyone there to pick it up? A
-          // heartbeat that stopped (and did not say `busy`) means AE quit,
-          // crashed, or is stuck in a modal — fail now, not at the deadline.
-          const current = await readInstance(dir, now);
+          // Still waiting to be picked up: is anyone there to pick it up?
+          current =
+            (await findInstance(instance.id, instancesDir, now, {
+              processes: this.processSource(),
+            })) ?? (await readInstance(dir, now));
           if (!current.alive) {
+            // Dead: AE quit or crashed (or, without process information, the
+            // heartbeat stopped without saying busy) — fail now, not at the deadline.
             await this.safeUnlink(requestPath);
             const dialogs = await this.scanDialogs();
             if (dialogs.length > 0) {
@@ -360,6 +447,21 @@ export class FileIpcTransport implements AeTransport {
               },
             );
           }
+          if (current.state === "stalled") {
+            if (now - lastDialogScanAt >= STALLED_DIALOG_SCAN_MS) {
+              lastDialogScanAt = now;
+              const dialogs = await this.dialogsFor(current);
+              if (dialogs.length > 0) {
+                await this.safeUnlink(requestPath);
+                return dialogFailure(
+                  dialogs,
+                  `After Effects instance '${instance.id}' is ${stateDetail(current)}; the request was never picked up and has been discarded`,
+                  started,
+                );
+              }
+            }
+            await this.maybeRearm(current, notes);
+          }
         }
       }
       await sleep(POLL_INTERVAL_MS);
@@ -369,7 +471,7 @@ export class FileIpcTransport implements AeTransport {
     const pullTimeoutMessage =
       `timeout after ${timeoutMs}ms waiting for After Effects instance '${instance.id}' to respond` +
       (reclaimed
-        ? " (the request was never picked up and has been discarded)"
+        ? ` (the request was never picked up and has been discarded; the instance is ${stateDetail(current)})`
         : " (the request WAS picked up by the instance; the operation may still be running)");
     const pullDialogs = await this.scanDialogs();
     if (pullDialogs.length > 0) return dialogFailure(pullDialogs, pullTimeoutMessage, started);
@@ -377,8 +479,94 @@ export class FileIpcTransport implements AeTransport {
       durationMs: Date.now() - started,
       hint:
         "Is After Effects showing a modal dialog, or rendering/previewing? Scripts wait for both. " +
-        "For a long operation, raise timeoutMs.",
+        "For a long operation, raise timeoutMs." +
+        (notes.length > 0 ? ` ${notes.join(" ")}` : ""),
     });
+  }
+
+  /** Dialogs of the instance's own process when it is known, else every AE's. */
+  private async dialogsFor(instance: InstanceInfo): Promise<AeDialog[]> {
+    const dialogs = await this.scanDialogs();
+    const pid = instance.process?.pid;
+    return pid === undefined ? dialogs : dialogs.filter((d) => d.pid === pid);
+  }
+
+  /**
+   * Re-arm a stalled agent whose scheduled task stopped firing, once it has
+   * been silent REARM_STALLED_MS, at most once per REARM_RETRY_MS per
+   * instance. The outcome goes to stderr and into `notes`.
+   */
+  private async maybeRearm(instance: InstanceInfo, notes: string[]): Promise<void> {
+    if (instance.state !== "stalled" || (instance.ageMs ?? 0) < REARM_STALLED_MS) return;
+    const last = this.rearmAttempts.get(instance.id);
+    if (last !== undefined && Date.now() - last < REARM_RETRY_MS) return;
+    this.rearmAttempts.set(instance.id, Date.now());
+    const message = await this.rearm(instance);
+    notes.push(message);
+    process.stderr.write(`mcp-aftereffects: ${message}\n`);
+  }
+
+  /**
+   * Push REARM_JSX into the instance through `-r` — the one path that still
+   * reaches an AE whose agent task stopped — and wait for a fresh heartbeat.
+   * Only when `-r` provably lands in THAT process: it was not started with
+   * `-m`, and it is the only running AfterFX.exe that was not.
+   */
+  private async rearm(instance: InstanceInfo): Promise<string> {
+    const what = `re-arm of agent '${instance.id}' (${stateDetail(instance)})`;
+    const proc = instance.process;
+    if (proc === null) return `${what} skipped: no After Effects process matched to it`;
+    if (proc.multiInstance) {
+      return (
+        `${what} skipped: that After Effects was started with -m, which -r scripts never reach — ` +
+        "close any dialog it shows, or save and restart it"
+      );
+    }
+    const source = this.processSource();
+    const procs = source === null ? null : await source();
+    const pushable = (procs ?? []).filter((p) => !p.multiInstance);
+    if (pushable.length !== 1 || pushable[0].pid !== proc.pid) {
+      return (
+        `${what} skipped: ${pushable.length} After Effects processes without -m are running, ` +
+        "so -r cannot be aimed at this one"
+      );
+    }
+    // Never push into a modal: it would only stack a second one on top.
+    const dialogs = (await this.scanDialogs()).filter((d) => d.pid === proc.pid);
+    if (dialogs.length > 0) return `${what} skipped: ${dialogBlockMessage(dialogs)}`;
+    const before = instance.heartbeat?.ts ?? 0;
+    const res = await this.executePush(
+      {
+        id: randomUUID(),
+        label: "agent.rearm",
+        code: REARM_JSX,
+        payload: null,
+        undoGroup: false,
+        suppressDialogs: true,
+      },
+      Date.now(),
+      REARM_PUSH_TIMEOUT_MS,
+      exeFromCommandLine(proc),
+    );
+    if (!res.ok) return `${what} failed: the push did not run (${res.errorCode}: ${res.error})`;
+    const r = (res.result ?? {}) as { agent?: boolean; via?: string };
+    if (r.agent === false) {
+      return (
+        `${what} failed: $.global.AE_MCP_AGENT does not exist in that After Effects — the agent never ` +
+        "loaded there. Check `mcp-aftereffects agent-status` and agent-fatal.log under the runtime root, " +
+        "then restart After Effects"
+      );
+    }
+    const via = r.via === "rearm" ? "rearm()" : "a hand-made re-arm (this agent predates rearm())";
+    const waitUntil = Date.now() + REARM_HEARTBEAT_WAIT_MS;
+    while (Date.now() < waitUntil) {
+      const after = await readInstance(instance.dir);
+      if (after.heartbeat !== null && after.heartbeat.ts > before && after.state !== "dead") {
+        return `${what}: re-armed via ${via}; the agent is ticking again`;
+      }
+      await sleep(200);
+    }
+    return `${what}: re-armed via ${via}, but no heartbeat came within ${REARM_HEARTBEAT_WAIT_MS} ms`;
   }
 
   // --- Push: launch the dispatcher into the registered instance ---------------
@@ -387,25 +575,29 @@ export class FileIpcTransport implements AeTransport {
     request: MailboxRequest,
     started: number,
     timeoutMs: number,
+    exeOverride: string | null = null,
   ): Promise<EvalResult> {
+    let exe: string;
     try {
-      this.afterFxPath ??= resolveAfterFxPath();
+      exe = exeOverride ?? (this.afterFxPath ??= resolveAfterFxPath());
     } catch (err) {
       return failure("AE_NOT_FOUND", err instanceof Error ? err.message : String(err), {
         durationMs: Date.now() - started,
       });
     }
 
-    // 0. A resident agent that registered and then stopped ticking is the
-    // signature of an After Effects stuck behind a dialog — and every `-r`
-    // launched at it would only stack a "Cannot run a script while a modal
-    // dialog is waiting for response" alert on top. Look before launching.
-    const known = await listInstances();
-    if (known.some((i) => !i.alive)) {
-      const dialogs = await this.scanDialogs();
-      if (dialogs.length > 0) {
-        return dialogFailure(dialogs, "nothing was sent to After Effects", started);
-      }
+    // 0. Never launch `-r` at an After Effects that shows a modal dialog: the
+    // script cannot run, and AE stacks a second modal ("Unable to execute
+    // script … Cannot run a script while a modal dialog is waiting for
+    // response") on top of the first. Seen on AE 27.0 behind an in-app
+    // warning ("Cached Preview needs 2 or more frames to play back"), so this
+    // looks before every launch, not only when an agent has gone quiet.
+    const known = await listInstances(undefined, undefined, {
+      processes: this.processSource(),
+    });
+    const openDialogs = await this.scanDialogs();
+    if (openDialogs.length > 0) {
+      return dialogFailure(openDialogs, "nothing was sent to After Effects", started);
     }
 
     // 0b. Is there an After Effects that can receive `-r` at all? If not,
@@ -452,9 +644,9 @@ export class FileIpcTransport implements AeTransport {
       // for the DoScript duration — either way the actual work happens inside
       // AE and we learn the outcome from the response file, not the child.
       const spawnState: SpawnState = { error: null, child: null, exited: false };
-      const launch = this.launchDispatcher(spawnState);
+      const launch = this.launchDispatcher(spawnState, exe);
       if (spawnState.error !== null) {
-        return await this.spawnFailure(spawnState.error, requestPath, started);
+        return await this.spawnFailure(spawnState.error, requestPath, started, exe);
       }
 
       // 4. Poll for OUR response file. While polling: keep the busy lock
@@ -478,7 +670,7 @@ export class FileIpcTransport implements AeTransport {
           return this.toEvalResult(parsed, Date.now() - started);
         }
         if (spawnState.error !== null) {
-          return await this.spawnFailure(spawnState.error, requestPath, started);
+          return await this.spawnFailure(spawnState.error, requestPath, started, exe);
         }
         const now = Date.now();
         if (now - lastRefreshAt >= BUSY_LOCK_REFRESH_MS) {
@@ -513,7 +705,7 @@ export class FileIpcTransport implements AeTransport {
             }
             attempts++;
             lastLaunchAt = Date.now();
-            this.launchDispatcher(spawnState);
+            this.launchDispatcher(spawnState, exe);
           }
         }
         await sleep(POLL_INTERVAL_MS);
@@ -579,8 +771,8 @@ export class FileIpcTransport implements AeTransport {
    * meaningful (osascript), a non-zero exit is treated the same way — that is
    * how a denied macOS Automation permission (-1743) surfaces in seconds.
    */
-  private launchDispatcher(state: SpawnState): LaunchPlan {
-    const launch = buildLaunchPlan(this.afterFxPath as string);
+  private launchDispatcher(state: SpawnState, exe: string): LaunchPlan {
+    const launch = buildLaunchPlan(exe);
     state.child = null;
     state.exited = false;
     try {
@@ -636,7 +828,9 @@ export class FileIpcTransport implements AeTransport {
       this.pushPreflightOkAt = Date.now();
       return null;
     }
-    const stale = known.filter((i) => !i.alive);
+    const stale = known.filter(
+      (i) => i.state === "stalled" || (!i.processChecked && !i.alive && i.heartbeat !== null),
+    );
     if (procs.length === 0) {
       return failure(
         "NO_INSTANCE",
@@ -786,21 +980,18 @@ export class FileIpcTransport implements AeTransport {
     err: Error,
     requestPath: string,
     started: number,
+    exe: string,
   ): Promise<EvalResult> {
     await this.safeUnlink(requestPath);
-    return failure(
-      "TRANSPORT",
-      `could not launch After Effects (${this.afterFxPath}): ${err.message}`,
-      {
-        stack: err.stack ?? null,
-        durationMs: Date.now() - started,
-        hint:
-          process.platform === "darwin"
-            ? "Check that AE_MCP_EXE points at the After Effects .app bundle and that your MCP client is " +
-              "allowed to control After Effects (System Settings → Privacy & Security → Automation)."
-            : "Check that AE_MCP_EXE points at a real AfterFX.exe and that After Effects is not blocked by policy or antivirus.",
-      },
-    );
+    return failure("TRANSPORT", `could not launch After Effects (${exe}): ${err.message}`, {
+      stack: err.stack ?? null,
+      durationMs: Date.now() - started,
+      hint:
+        process.platform === "darwin"
+          ? "Check that AE_MCP_EXE points at the After Effects .app bundle and that your MCP client is " +
+            "allowed to control After Effects (System Settings → Privacy & Security → Automation)."
+          : "Check that AE_MCP_EXE points at a real AfterFX.exe and that After Effects is not blocked by policy or antivirus.",
+    });
   }
 
   private toEvalResult(parsed: DispatcherResponse, durationMs: number): EvalResult {
@@ -882,7 +1073,7 @@ export class FileIpcTransport implements AeTransport {
       } catch {
         /* no lock, or raced with its owner */
       }
-      await sweepDeadInstanceDirs();
+      await sweepDeadInstanceDirs(undefined, undefined, { processes: this.processSource() });
     } catch {
       /* directory missing or unreadable — setupError already covers it */
     }
@@ -913,6 +1104,15 @@ function dialogFailure(dialogs: AeDialog[], outcome: string, started: number): E
     hint: dialogHint(dialogs),
     dialogs,
   });
+}
+
+/** The AfterFX.exe a process was started from (its command line's first argument), or null. */
+export function exeFromCommandLine(proc: Pick<AeProcess, "commandLine">): string | null {
+  const cmd = proc.commandLine.trim();
+  const quoted = /^"([^"]+)"/.exec(cmd);
+  if (quoted) return quoted[1];
+  const bare = /^(\S+?\.exe)(\s|$)/i.exec(cmd);
+  return bare ? bare[1] : null;
 }
 
 function sleep(ms: number): Promise<void> {

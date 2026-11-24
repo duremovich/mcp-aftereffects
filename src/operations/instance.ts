@@ -38,9 +38,13 @@ import {
 import {
   type InstanceInfo,
   describeInstance,
+  findInstance,
+  getInstanceProcessSource,
   instanceLabel,
   listInstances,
   readInstance,
+  stateDetail,
+  sweepDeadInstanceDirs,
 } from "../transport/instances.js";
 import { buildInstanceLaunchPlan } from "../transport/launcher.js";
 
@@ -64,7 +68,12 @@ function summarizeInstance(i: InstanceInfo) {
   return {
     label: instanceLabel(i),
     id: i.id,
+    /** live | busy | stalled | dead — see transport/instances.ts. */
+    state: i.state,
+    detail: stateDetail(i),
+    /** Addressable: any state but dead. */
     alive: i.alive,
+    pid: i.process?.pid ?? null,
     busy: i.heartbeat?.busy ?? false,
     project: i.heartbeat?.project ?? null,
     projectName: i.heartbeat?.projectName ?? null,
@@ -93,19 +102,27 @@ registerOp({
   name: "instance.list",
   category: "instance",
   description:
-    "List the After Effects instances whose resident agent is live — id, open project, busy state — " +
+    "List the After Effects instances that have run the resident agent — id, open project, state, pid — " +
     "and which one this call would address. Instances are separate After Effects processes " +
     "(AfterFX.exe -m), each with its own project; address one on any tool with `instance: <id or project name>`. " +
-    "Stale entries are instances that quit or stopped ticking (a modal dialog blocks scripting).",
+    "States: live (agent ticking), busy (serving a request), stalled (After Effects runs but its agent has " +
+    "not ticked for a while — a modal dialog, a render, or a stopped task the server re-arms; calls queue), " +
+    "dead (its After Effects process is gone; never addressed). Dead entries older than an hour are removed.",
   params: [],
   readOnly: true,
   toJsx: () => nodeOnly("instance.list"),
   async run(_args, transport) {
-    const instances = await listInstances();
+    const swept = await sweepDeadInstanceDirs();
+    const instances = await listInstances(undefined, undefined, { matchAll: true });
+    const addressable = instances.filter((i) => i.alive).map((i) => i.id);
     return {
       ok: true,
       instances: instances.map(summarizeInstance),
-      live: instances.filter((i) => i.alive).map((i) => i.id),
+      addressable,
+      /** Same as `addressable` (every state but dead); kept for existing callers. */
+      live: addressable,
+      dead: instances.filter((i) => !i.alive).map((i) => i.id),
+      swept,
       target: await describeTargetOf(transport),
     };
   },
@@ -338,9 +355,10 @@ registerOp({
   category: "instance",
   description:
     "Quit an After Effects instance by name. Refuses while the project has unsaved changes unless `save: true` " +
-    "(save in place — the project must have a file) or `discardChanges: true`. Returns once the instance has " +
-    "gone quiet. Use on workers you started with instance.start; it works on any live instance, so check " +
-    "instance.list before stopping one you did not start.",
+    "(save in place — the project must have a file) or `discardChanges: true`. Returns once its After Effects " +
+    "process has exited (Windows; elsewhere once its agent has gone quiet), and reports it when the process " +
+    "keeps running — usually a dialog, see instance.dialogs. Works on live, busy and stalled instances. Use on " +
+    "workers you started with instance.start; check instance.list before stopping one you did not start.",
   params: [
     {
       name: "name",
@@ -363,7 +381,7 @@ registerOp({
     {
       name: "timeoutMs",
       type: "number",
-      description: `How long to wait for the instance to go quiet (default ${DEFAULT_STOP_TIMEOUT_MS}).`,
+      description: `How long to wait for the instance's After Effects to exit (default ${DEFAULT_STOP_TIMEOUT_MS}).`,
       required: false,
     },
   ],
@@ -375,12 +393,17 @@ registerOp({
         errorCode: "INVALID_ARGS",
       });
     const dir = instanceDirFor(name);
-    const before = await readInstance(dir);
+    const before =
+      (await findInstance(name, undefined, undefined, { matchAll: true })) ??
+      (await readInstance(dir));
     if (!before.alive) {
       return fail(`instance '${name}' is not live (${describeInstance(before)})`, {
         errorCode: "NO_INSTANCE",
       });
     }
+    // The process to watch: quitting is done when it has exited, not when the
+    // heartbeat goes quiet — a modal dialog silences the heartbeat too.
+    const pid = before.process?.pid ?? null;
 
     const res = await transport.execute({
       instance: name,
@@ -408,15 +431,21 @@ registerOp({
     });
 
     let file: string | null = null;
+    let quitNote: string | null = null;
     if (res.ok) {
       const r = res.result as { ok: boolean; error?: string; file?: string | null };
       if (r.ok === false) return fail(r.error ?? "refused");
       file = r.file ?? null;
-    } else if (res.errorCode !== "TIMEOUT" && res.errorCode !== "NO_INSTANCE") {
+    } else if (res.errorCode === "TIMEOUT" || res.errorCode === "NO_INSTANCE") {
       // app.quit() may tear the process down before the response lands;
       // a timeout or a vanished heartbeat is therefore not a failure here —
       // the wait below decides. Anything else is.
-      return fail(res.error ?? "unknown failure");
+      quitNote = res.error ?? null;
+    } else {
+      return {
+        ...fail(res.error ?? "unknown failure", res.errorCode ? { errorCode: res.errorCode } : {}),
+        ...(res.dialogs ? { dialogs: res.dialogs } : {}),
+      };
     }
 
     const timeoutMs =
@@ -424,22 +453,67 @@ registerOp({
         ? args.timeoutMs
         : DEFAULT_STOP_TIMEOUT_MS;
     const deadline = Date.now() + timeoutMs;
+    const source = getInstanceProcessSource();
     let gone = false;
+    let verifiedBy: "process" | "heartbeat" = pid !== null ? "process" : "heartbeat";
     while (Date.now() < deadline) {
-      const now = await readInstance(dir);
-      if (!now.alive) {
+      if (pid !== null && source !== null) {
+        const procs = await source();
+        if (procs !== null) {
+          if (!procs.some((p) => p.pid === pid)) {
+            gone = true;
+            break;
+          }
+          await sleep(500);
+          continue;
+        }
+        verifiedBy = "heartbeat";
+      }
+      // No process information: the heartbeat going quiet is all there is.
+      if (!(await readInstance(dir)).alive) {
         gone = true;
         break;
       }
       await sleep(500);
     }
     if (!gone) {
-      return fail(
-        `instance '${name}' accepted the quit but is still ticking after ${timeoutMs} ms — check it for a dialog`,
-      );
+      const dialogs = (await scanAeDialogs()).filter((d) => pid === null || d.pid === pid);
+      const where =
+        pid !== null ? `its After Effects (pid ${pid}) is still running` : "it is still ticking";
+      const why =
+        quitNote !== null
+          ? ` — the quit may never have been picked up (${quitNote.split("\n")[0]})`
+          : "";
+      if (dialogs.length > 0) {
+        return {
+          ...fail(
+            `instance '${name}': ${where} ${timeoutMs} ms after the quit${why}: ${dialogBlockMessage(dialogs)}`,
+            { errorCode: "DIALOG_OPEN", hint: dialogHint(dialogs) },
+          ),
+          dialogs,
+          pid,
+        };
+      }
+      return {
+        ...fail(`instance '${name}': ${where} ${timeoutMs} ms after the quit${why}`, {
+          hint:
+            "After Effects is most likely waiting on a dialog (often hidden behind its main window): " +
+            "check instance.dialogs, close it with instance.dismiss_dialog or ask the user, then retry. " +
+            "The instance directory was kept.",
+        }),
+        pid,
+      };
     }
     await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
-    return { ok: true, instance: name, stopped: true, saved: !!args.save, file };
+    return {
+      ok: true,
+      instance: name,
+      stopped: true,
+      pid,
+      verifiedBy,
+      saved: !!args.save,
+      file,
+    };
   },
 });
 

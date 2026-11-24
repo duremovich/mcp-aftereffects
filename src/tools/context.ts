@@ -162,7 +162,9 @@ export const contextTool = defineTool({
       instances: instances.map((i) => ({
         label: instanceLabel(i),
         id: i.id,
+        state: i.state,
         alive: i.alive,
+        pid: i.process?.pid ?? null,
         busy: i.heartbeat?.busy ?? false,
         project: i.heartbeat?.project ?? null,
         aeVersion: i.heartbeat?.aeVersion ?? null,

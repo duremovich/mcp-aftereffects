@@ -175,6 +175,15 @@ set AE_MCP_INSTANCE=shotA
 
 An unnamed instance gets a random id (`ae-…`) and can still be addressed by its project file. With exactly one live agent no configuration is needed at all; with several live and none named, calls fail with `NO_INSTANCE` instead of guessing.
 
+`instance.list` reports each instance in one of four states. On Windows the server ties every agent to its running `AfterFX.exe` (by start time), so the state reflects the process, not just the heartbeat file:
+
+- `live` — the agent is ticking.
+- `busy` — the agent is serving a request; ticks resume when it returns. Addressable.
+- `stalled` — After Effects runs but the agent has stopped ticking: a modal dialog (calls then fail with `DIALOG_OPEN`), a long render, or a scheduled task that stopped firing, which the server re-arms after 20 s when `-r` can reach that instance. Addressable; requests queue meanwhile.
+- `dead` — the After Effects process is gone. Never addressed or counted; its directory is removed after an hour.
+
+Without process information (macOS) an instance is live while its heartbeat is fresh, busy while a `busy` heartbeat is under 15 minutes old, and dead otherwise. A changed agent takes effect at the next After Effects launch.
+
 The agent keeps polling its mailbox for as long as After Effects runs, server or no server, so the mailbox directory under your per-user temp folder stays the trust boundary for the whole session. The mailbox location is fixed into the startup script when you install it; if you change `AE_MCP_RUNTIME_DIR`, run `install-agent` again (`agent-status` tells you when it is out of date).
 
 ### Parallel Work with Worker Instances
