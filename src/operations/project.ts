@@ -928,22 +928,31 @@ registerOp({
   category: "project",
   appConfig: true,
   description:
-    "Configure Multi-Frame Rendering (app.setMultiFrameRenderingConfig, AE 22.0+): on/off and the maximum CPU percentage MFR may use.",
+    "Turn Multi-Frame Rendering on or off in AE's preferences (Memory & Performance), lasting until changed again, and optionally set the maximum CPU percentage it may use. Writes the preference itself: app.setMultiFrameRenderingConfig is NOT used because AE resets it when the calling script ends, so it never affects a later call (verified on AE 27.0). Returns the values AE reads back.",
   params: [
     { name: "enabled", type: "boolean", description: "Enable MFR", required: true },
     {
       name: "maxCpuPercent",
       type: "number",
-      description: "Max CPU % for MFR (1-100, default 90)",
+      description: "Max CPU % for MFR (1-100). Omit to leave the current setting unchanged.",
       required: false,
-      default: 90,
     },
   ],
   toJsx(args) {
+    const cpu =
+      args.maxCpuPercent === undefined || args.maxCpuPercent === null
+        ? ""
+        : `app.preferences.savePrefAsString(sec, "Reserved CPU Power", String(100 - Math.round(${jsxVal(args.maxCpuPercent)})), t);`;
     return `
-            if (typeof app.setMultiFrameRenderingConfig !== "function") return { ok: false, error: "setMultiFrameRenderingConfig needs AE 22.0+" };
-            try { app.setMultiFrameRenderingConfig(${jsxVal(args.enabled)}, ${jsxVal(args.maxCpuPercent ?? 90)}); } catch (eMf) { return { ok: false, error: "setMultiFrameRenderingConfig failed: " + AE.errText(eMf) }; }
-            return { ok: true, enabled: ${jsxVal(args.enabled)}, maxCpuPercent: ${jsxVal(args.maxCpuPercent ?? 90)} };
+            var sec = "Concurrent Frame Rendering", t = PREFType.PREF_Type_MACHINE_SPECIFIC;
+            try {
+                app.preferences.savePrefAsBool(sec, "Enable Concurrent Frame Renders", ${jsxVal(args.enabled)}, t);
+                ${cpu}
+            } catch (eMf) { return { ok: false, error: "saving the MFR preference failed: " + AE.errText(eMf) }; }
+            var on = app.preferences.getPrefAsBool(sec, "Enable Concurrent Frame Renders", t);
+            var reserved = parseInt(app.preferences.getPrefAsString(sec, "Reserved CPU Power", t), 10);
+            if (on !== ${jsxVal(args.enabled)}) return { ok: false, error: "AE did not keep the MFR preference", enabled: on };
+            return { ok: true, enabled: on, maxCpuPercent: isNaN(reserved) ? null : 100 - reserved };
         `;
   },
 });

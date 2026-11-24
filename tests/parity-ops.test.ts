@@ -763,9 +763,17 @@ describe("low-priority parity ops", () => {
     expect(
       getOp("project.set_memory_limits")!.toJsx({ imageCachePercent: 50, maxMemoryPercent: 80 }),
     ).toContain("setMemoryUsageLimits(50, 80)");
-    const mfr = getOp("project.set_multi_frame_rendering")!.toJsx({ enabled: true });
-    expect(mfr).toContain("setMultiFrameRenderingConfig(true, 90)");
-    expect(mfr).toContain("AE 22.0+");
+    // Writes the preference: app.setMultiFrameRenderingConfig only lasts until
+    // the calling script ends, so it must not be what this op relies on.
+    const mfr = getOp("project.set_multi_frame_rendering")!.toJsx({ enabled: false });
+    expect(mfr).toContain('"Enable Concurrent Frame Renders", false');
+    expect(mfr).not.toContain("setMultiFrameRenderingConfig(");
+    expect(mfr).not.toContain('"Reserved CPU Power", String');
+    const cpu = getOp("project.set_multi_frame_rendering")!.toJsx({
+      enabled: true,
+      maxCpuPercent: 75,
+    });
+    expect(cpu).toContain("String(100 - Math.round(75))");
   });
 
   it("pref ops type the value path and validate prefType", () => {
